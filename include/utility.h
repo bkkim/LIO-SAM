@@ -1,7 +1,7 @@
 #pragma once
 #ifndef _UTILITY_LIDAR_ODOMETRY_H_
 #define _UTILITY_LIDAR_ODOMETRY_H_
-#define PCL_NO_PRECOMPILE 
+#define PCL_NO_PRECOMPILE
 
 #include <ros/ros.h>
 
@@ -15,7 +15,7 @@
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 
-#include <opencv/cv.h>
+//#include <opencv/cv.h>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -25,17 +25,21 @@
 #include <pcl/common/common.h>
 #include <pcl/common/transforms.h>
 #include <pcl/registration/icp.h>
+#include <pcl/registration/gicp.h>
+#include <pcl/registration/ndt.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl/filters/crop_box.h> 
+#include <pcl/filters/crop_box.h>
 #include <pcl_conversions/pcl_conversions.h>
+
+#include <opencv2/opencv.hpp>
 
 #include <tf/LinearMath/Quaternion.h>
 #include <tf/transform_listener.h>
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
- 
+
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -54,11 +58,14 @@
 #include <thread>
 #include <mutex>
 
+#include <chrono> // duration time check (bkkim)
+
 using namespace std;
 
 typedef pcl::PointXYZI PointType;
 
-enum class SensorType { VELODYNE, OUSTER, LIVOX };
+enum class SensorType { VELODYNE, OUSTER, LIVOX, MLX };
+enum class SensorMode { HORIZON, VERTICAL };
 
 class ParamServer
 {
@@ -68,13 +75,13 @@ public:
 
     std::string robot_id;
 
-    //Topics
+    // Topics
     string pointCloudTopic;
     string imuTopic;
     string odomTopic;
     string gpsTopic;
 
-    //Frames
+    // Frames
     string lidarFrame;
     string baselinkFrame;
     string odometryFrame;
@@ -97,6 +104,8 @@ public:
     int downsampleRate;
     float lidarMinRange;
     float lidarMaxRange;
+    SensorMode sensor_mode;
+
 
     // IMU
     float imuAccNoise;
@@ -119,12 +128,12 @@ public:
     int edgeFeatureMinValidNum;
     int surfFeatureMinValidNum;
 
-    // voxel filter paprams
+    // voxel filter params
     float odometrySurfLeafSize;
     float mappingCornerLeafSize;
-    float mappingSurfLeafSize ;
+    float mappingSurfLeafSize;
 
-    float z_tollerance; 
+    float z_tollerance;
     float rotation_tollerance;
 
     // CPU Params
@@ -132,19 +141,39 @@ public:
     double mappingProcessInterval;
 
     // Surrounding map
-    float surroundingkeyframeAddingDistThreshold; 
-    float surroundingkeyframeAddingAngleThreshold; 
+    float surroundingKeyframeAddingDistThreshold;
+    float surroundingKeyframeAddingAngleThreshold;
     float surroundingKeyframeDensity;
     float surroundingKeyframeSearchRadius;
-    
+
     // Loop closure
-    bool  loopClosureEnableFlag;
+    bool loopClosureEnableFlag;
     float loopClosureFrequency;
-    int   surroundingKeyframeSize;
+    int surroundingKeyframeSize;
     float historyKeyframeSearchRadius;
     float historyKeyframeSearchTimeDiff;
-    int   historyKeyframeSearchNum;
+    int historyKeyframeSearchNum;
     float historyKeyframeFitnessScore;
+
+    // Save (kbk)
+    bool saveKeyframeFlag;
+    bool saveIcpframeFlag;
+    bool saveDBoWFlag;     // Save the DBoW pair image
+    int loopClosureType;   // 0 is origin(distance), 1 is DBoW
+    int keyframeType;      // 0 is distance(pose), 1 is time(1 second)
+    int keyframeSearchGap; // 20 is DBoW search gap
+    int keyframeMaxDist;   // 3 is DBoW search max distance
+    float dbowMinScore;    // 0.5 is DBoW result min score
+    string dbowVocPath;    // dbow vocabulary path
+    string saveDataPath;   // Path for KeyFrame image 
+
+    // Log output (kbk)
+    bool odomInfo;   // lidar odometry info (x, y, z)
+    bool ipTime;     // imageProjection processing time
+    bool feTime;     // featureExtraction processing time
+    bool moTime;     // mapOptimization processing time
+    
+    
 
     // global map visualization radius
     float globalMapVisualizationSearchRadius;
@@ -153,7 +182,7 @@ public:
 
     ParamServer()
     {
-        nh.param<std::string>("/robot_id", robot_id, "roboat");
+        nh.param<std::string>("/robot_id", robot_id, "robot");
 
         nh.param<std::string>("lio_sam/pointCloudTopic", pointCloudTopic, "points_raw");
         nh.param<std::string>("lio_sam/imuTopic", imuTopic, "imu_correct");
@@ -187,6 +216,10 @@ public:
         {
             sensor = SensorType::LIVOX;
         }
+        else if (sensorStr == "mlx")
+        {
+            sensor = SensorType::MLX;
+        }
         else
         {
             ROS_ERROR_STREAM(
@@ -199,6 +232,25 @@ public:
         nh.param<int>("lio_sam/downsampleRate", downsampleRate, 1);
         nh.param<float>("lio_sam/lidarMinRange", lidarMinRange, 1.0);
         nh.param<float>("lio_sam/lidarMaxRange", lidarMaxRange, 1000.0);
+        int mode = 0;
+        nh.param<int>("lio_sam/sensor_mode", mode, 1);
+        if (mode == 1)
+        {
+            sensor_mode = SensorMode::HORIZON;
+        }
+        else if (mode == 0)
+        {
+            sensor_mode = SensorMode::VERTICAL;
+            int tmp = N_SCAN;
+            N_SCAN = Horizon_SCAN;
+            Horizon_SCAN = tmp;
+        }
+        else
+        {
+            ROS_ERROR_STREAM(
+                "Invalid sensor mode (must be either 1(horizon) or 0(vertical).");
+            ros::shutdown();
+        }
 
         nh.param<float>("lio_sam/imuAccNoise", imuAccNoise, 0.01);
         nh.param<float>("lio_sam/imuGyrNoise", imuGyrNoise, 0.001);
@@ -229,8 +281,8 @@ public:
         nh.param<int>("lio_sam/numberOfCores", numberOfCores, 2);
         nh.param<double>("lio_sam/mappingProcessInterval", mappingProcessInterval, 0.15);
 
-        nh.param<float>("lio_sam/surroundingkeyframeAddingDistThreshold", surroundingkeyframeAddingDistThreshold, 1.0);
-        nh.param<float>("lio_sam/surroundingkeyframeAddingAngleThreshold", surroundingkeyframeAddingAngleThreshold, 0.2);
+        nh.param<float>("lio_sam/surroundingKeyframeAddingDistThreshold", surroundingKeyframeAddingDistThreshold, 1.0);
+        nh.param<float>("lio_sam/surroundingKeyframeAddingAngleThreshold", surroundingKeyframeAddingAngleThreshold, 0.2);
         nh.param<float>("lio_sam/surroundingKeyframeDensity", surroundingKeyframeDensity, 1.0);
         nh.param<float>("lio_sam/surroundingKeyframeSearchRadius", surroundingKeyframeSearchRadius, 50.0);
 
@@ -241,6 +293,23 @@ public:
         nh.param<float>("lio_sam/historyKeyframeSearchTimeDiff", historyKeyframeSearchTimeDiff, 30.0);
         nh.param<int>("lio_sam/historyKeyframeSearchNum", historyKeyframeSearchNum, 25);
         nh.param<float>("lio_sam/historyKeyframeFitnessScore", historyKeyframeFitnessScore, 0.3);
+
+        // kbk
+        nh.param<bool>("lio_sam/saveKeyframeFlag", saveKeyframeFlag, false);
+        nh.param<bool>("lio_sam/saveIcpframeFlag", saveIcpframeFlag, false);
+        nh.param<bool>("lio_sam/saveDBoWFlag", saveDBoWFlag, false);
+        nh.param<int>("lio_sam/loopClosureType", loopClosureType, 1);
+        nh.param<int>("lio_sam/keyframeType", keyframeType, 1);
+        nh.param<int>("lio_sam/keyframeSearchGap", keyframeSearchGap, 20);
+        nh.param<int>("lio_sam/keyframeMaxDist", keyframeMaxDist, 3);
+        nh.param<float>("lio_sam/dbowMinScore", dbowMinScore, 0.5);
+        nh.param<std::string>("lio_sam/dbowVocPath", dbowVocPath, "/home/kbk/2025_catkin/test_liosam_ws/small_voc.yml.gz");
+        nh.param<std::string>("lio_sam/saveDataPath", saveDataPath, "/home/kbk/Downloads/lio_sam/");
+        
+        nh.param<bool>("lio_sam/odomInfo", odomInfo, false);
+        nh.param<bool>("lio_sam/ipTime", ipTime, false);
+        nh.param<bool>("lio_sam/feTime", feTime, false);
+        nh.param<bool>("lio_sam/moTime", moTime, false);
 
         nh.param<float>("lio_sam/globalMapVisualizationSearchRadius", globalMapVisualizationSearchRadius, 1e3);
         nh.param<float>("lio_sam/globalMapVisualizationPoseDensity", globalMapVisualizationPoseDensity, 10.0);
@@ -272,6 +341,7 @@ public:
         imu_out.orientation.z = q_final.z();
         imu_out.orientation.w = q_final.w();
 
+        // modified by bkkim [] // in using 6 axis imu sensor
         if (sqrt(q_final.x()*q_final.x() + q_final.y()*q_final.y() + q_final.z()*q_final.z() + q_final.w()*q_final.w()) < 0.1)
         {
             ROS_ERROR("Invalid quaternion, please use a 9-axis IMU!");
