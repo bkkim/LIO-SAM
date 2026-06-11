@@ -163,7 +163,11 @@ public:
     int keyframeMaxDist;   // 3 is DBoW search max distance
     float dbowMinScore;    // 0.5 is DBoW result min score
     string dbowVocPath;    // dbow vocabulary path
-    string saveDataPath;   // Path for KeyFrame image 
+    string saveDataPath;   // Path for KeyFrame image
+
+    // Map reuse (kbk)
+    bool loadMapFlag;      // Load existing map for relocalization
+    string loadMapPath;    // Path to saved map directory
 
     // Log output (kbk)
     bool odomInfo;   // lidar odometry info (x, y, z)
@@ -303,7 +307,9 @@ public:
         nh.param<float>("lio_sam/dbowMinScore", dbowMinScore, 0.5);
         nh.param<std::string>("lio_sam/dbowVocPath", dbowVocPath, "/home/kbk/2025_catkin/test_liosam_ws/small_voc.yml.gz");
         nh.param<std::string>("lio_sam/saveDataPath", saveDataPath, "/home/kbk/Downloads/lio_sam/");
-        
+        nh.param<bool>("lio_sam/loadMapFlag", loadMapFlag, false);
+        nh.param<std::string>("lio_sam/loadMapPath", loadMapPath, "/home/kbk/Downloads/lio_sam/");
+
         nh.param<bool>("lio_sam/odomInfo", odomInfo, false);
         nh.param<bool>("lio_sam/ipTime", ipTime, false);
         nh.param<bool>("lio_sam/feTime", feTime, false);

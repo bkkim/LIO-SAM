@@ -100,14 +100,18 @@ lio_sam:
   # DBoW Loop closure (kbk)
   saveKeyframeFlag: true                       # keyframe pointcloud data
   saveIcpframeFlag: false                       # icp result pointcloud between current and keyframe
-  saveDBoWFlag: false                           # keyframe image & dbow3 search result image between current and keyframe
+  saveDBoWFlag: true                           # keyframe image & dbow3 search result image between current and keyframe
   loopClosureType: 1                            # 0 : distance (original), 1 : DBoW (kbk)
   keyframeType: 1                               # 0 : only use pose6d, 1 : duration between current and prev keyframe (1 second)
   keyframeSearchGap: 10 #20                     # DBoW Search Duration
   keyframeMaxDist: 5 #3                         # DBoW Search Max Distance
   dbowMinScore: 0.5
-  dbowVocPath: "/home/wave/2025_workspace/test_liosam_ws/small_voc.yml.gz"
-  saveDataPath: "/home/wave/2025_workspace/liosam_keyframes/"
+  dbowVocPath: "/home/wave/2026_workspace/test_liosam_ws/small_voc.yml.gz"
+  saveDataPath: "/home/wave/2026_workspace/liosam_keyframes/"
+
+  # Map reuse
+  loadMapFlag: false                             # load existing map for relocalization
+  loadMapPath: "/home/wave/2026_workspace/liosam_keyframes/"  # path to saved map directory
 
   # Debug Log
   odomInfo: true                               # odometry pose (x, y, z)
