@@ -174,6 +174,8 @@ public:
     bool isRelocalized = false;
     int  priorKeyframeCount = 0;
 
+    size_t lastKdtreePoseSize = 0;
+
     std::chrono::milliseconds totalTime; // kbk
     int totalCnt;
 
@@ -1088,7 +1090,11 @@ public:
         std::vector<float> pointSearchSqDis;
 
         // extract all the nearby key poses and downsample them
-        kdtreeSurroundingKeyPoses->setInputCloud(cloudKeyPoses3D); // create kd-tree
+        if (cloudKeyPoses3D->size() != lastKdtreePoseSize)
+        {
+            kdtreeSurroundingKeyPoses->setInputCloud(cloudKeyPoses3D);
+            lastKdtreePoseSize = cloudKeyPoses3D->size();
+        }
         kdtreeSurroundingKeyPoses->radiusSearch(cloudKeyPoses3D->back(), (double)surroundingKeyframeSearchRadius, pointSearchInd, pointSearchSqDis);
         for (int i = 0; i < (int)pointSearchInd.size(); ++i)
         {
