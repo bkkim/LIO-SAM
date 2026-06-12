@@ -130,6 +130,8 @@ public:
 
     pcl::VoxelGrid<PointType> downSizeFilterCorner;
     pcl::VoxelGrid<PointType> downSizeFilterSurf;
+    pcl::VoxelGrid<PointType> downSizeFilterCornerMap; // coarser filter for submap aggregate
+    pcl::VoxelGrid<PointType> downSizeFilterSurfMap;
     pcl::VoxelGrid<PointType> downSizeFilterICP;
     pcl::VoxelGrid<PointType> downSizeFilterSurroundingKeyPoses; // for surrounding key poses of scan-to-map optimization
 
@@ -175,6 +177,8 @@ public:
     int  priorKeyframeCount = 0;
 
     size_t lastKdtreePoseSize = 0;
+    size_t lastCornerMapSize  = 0;
+    size_t lastSurfMapSize    = 0;
 
     std::chrono::milliseconds totalTime; // kbk
     int totalCnt;
@@ -211,6 +215,9 @@ public:
         downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
         downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
         downSizeFilterICP.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
+        // submap filters: 4x coarser than per-frame filters to keep scan-to-map fast
+        downSizeFilterCornerMap.setLeafSize(mappingCornerLeafSize * 4, mappingCornerLeafSize * 4, mappingCornerLeafSize * 4);
+        downSizeFilterSurfMap.setLeafSize(mappingSurfLeafSize * 4,   mappingSurfLeafSize * 4,   mappingSurfLeafSize * 4);
         downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
 
         allocateMemory();
@@ -329,24 +336,38 @@ public:
             // Map reuse: attempt relocalization until succeeded
             if (mapLoaded && !isRelocalized)
             {
+                auto tr0 = std::chrono::high_resolution_clock::now();
                 downsampleCurrentScan();
+                auto tr1 = std::chrono::high_resolution_clock::now();
                 tryRelocalize();
+                auto tr2 = std::chrono::high_resolution_clock::now();
+                if (moTime) {
+                    auto ms = [](auto a, auto b){ return std::chrono::duration_cast<std::chrono::milliseconds>(b-a).count(); };
+                    std::cout << "  [reloc] downsample=" << ms(tr0,tr1)
+                              << " tryRelocalize=" << ms(tr1,tr2) << " ms" << std::endl;
+                }
                 return;
             }
 
             updateInitialGuess();
 
+            auto t0 = std::chrono::high_resolution_clock::now();
             extractSurroundingKeyFrames();
-
+            auto t1 = std::chrono::high_resolution_clock::now();
             downsampleCurrentScan();
-
-            //auto mid_s = std::chrono::high_resolution_clock::now();
+            auto t2 = std::chrono::high_resolution_clock::now();
             scan2MapOptimization();
-            //auto mid_e = std::chrono::high_resolution_clock::now();
-            //auto mid_d = std::chrono::duration_cast<std::chrono::milliseconds>(mid_e - mid_s);
-            //std::cout << "scan2Mapoptimization() : " << mid_d.count() << " ms" << std::endl;
-
+            auto t3 = std::chrono::high_resolution_clock::now();
             saveKeyFramesAndFactor();
+            auto t4 = std::chrono::high_resolution_clock::now();
+
+            if (moTime) {
+                auto ms = [](auto a, auto b){ return std::chrono::duration_cast<std::chrono::milliseconds>(b-a).count(); };
+                std::cout << "  [breakdown] extract=" << ms(t0,t1)
+                          << " downsample=" << ms(t1,t2)
+                          << " scan2map=" << ms(t2,t3)
+                          << " saveKF=" << ms(t3,t4) << " ms" << std::endl;
+            }
 
             correctPoses();
 
@@ -1149,13 +1170,13 @@ public:
             }
         }
 
-        // Downsample the surrounding corner key frames (or map)
-        downSizeFilterCorner.setInputCloud(laserCloudCornerFromMap);
-        downSizeFilterCorner.filter(*laserCloudCornerFromMapDS);
+        // Downsample the surrounding corner key frames (or map) — use coarser submap filter
+        downSizeFilterCornerMap.setInputCloud(laserCloudCornerFromMap);
+        downSizeFilterCornerMap.filter(*laserCloudCornerFromMapDS);
         laserCloudCornerFromMapDSNum = laserCloudCornerFromMapDS->size();
         // Downsample the surrounding surf key frames (or map)
-        downSizeFilterSurf.setInputCloud(laserCloudSurfFromMap);
-        downSizeFilterSurf.filter(*laserCloudSurfFromMapDS);
+        downSizeFilterSurfMap.setInputCloud(laserCloudSurfFromMap);
+        downSizeFilterSurfMap.filter(*laserCloudSurfFromMapDS);
         laserCloudSurfFromMapDSNum = laserCloudSurfFromMapDS->size();
 
         // clear map cache if too large
@@ -1168,14 +1189,10 @@ public:
         if (cloudKeyPoses3D->points.empty() == true)
             return;
 
-        //if (loopClosureEnableFlag == true)
-        //{
-        //    extractForLoopClosure();
-        //} else {
-        //    extractNearby();
-        //}
-
-        extractNearby();
+        if (loopClosureEnableFlag == true)
+            extractForLoopClosure();
+        else
+            extractNearby();
     }
 
     void downsampleCurrentScan()
@@ -1512,8 +1529,18 @@ public:
 
         if (laserCloudCornerLastDSNum > edgeFeatureMinValidNum && laserCloudSurfLastDSNum > surfFeatureMinValidNum)
         {
-            kdtreeCornerFromMap->setInputCloud(laserCloudCornerFromMapDS);
-            kdtreeSurfFromMap->setInputCloud(laserCloudSurfFromMapDS);
+            ROS_INFO_THROTTLE(2.0, "[scan2map] submap corner=%d surf=%d / cur corner=%d surf=%d",
+                laserCloudCornerFromMapDSNum, laserCloudSurfFromMapDSNum,
+                laserCloudCornerLastDSNum,    laserCloudSurfLastDSNum);
+
+            if (laserCloudCornerFromMapDS->size() != lastCornerMapSize ||
+                laserCloudSurfFromMapDS->size()   != lastSurfMapSize)
+            {
+                kdtreeCornerFromMap->setInputCloud(laserCloudCornerFromMapDS);
+                kdtreeSurfFromMap->setInputCloud(laserCloudSurfFromMapDS);
+                lastCornerMapSize = laserCloudCornerFromMapDS->size();
+                lastSurfMapSize   = laserCloudSurfFromMapDS->size();
+            }
 
             for (int iterCount = 0; iterCount < 30; iterCount++)
             {
@@ -1739,12 +1766,15 @@ public:
         pcl::PointCloud<PointType>::Ptr currentScan(new pcl::PointCloud<PointType>());
         *currentScan += *laserCloudCornerLastDS;
         *currentScan += *laserCloudSurfLastDS;
-        if ((int)currentScan->size() < 300) return;
+        ROS_INFO("[Relocalize] currentScan size: %d (corner=%d surf=%d)",
+                 (int)currentScan->size(), laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
+        if ((int)currentScan->size() < 300) { ROS_WARN("[Relocalize] currentScan too small (<300), skip"); return; }
 
         // Build reference cloud from matched keyframe neighborhood (world frame)
         pcl::PointCloud<PointType>::Ptr refCloud(new pcl::PointCloud<PointType>());
         loopFindNearKeyframes(refCloud, matchedKey, historyKeyframeSearchNum);
-        if ((int)refCloud->size() < 1000) return;
+        ROS_INFO("[Relocalize] refCloud size: %d", (int)refCloud->size());
+        if ((int)refCloud->size() < 1000) { ROS_WARN("[Relocalize] refCloud too small (<1000), skip"); return; }
 
         // Transform current scan to approximate world frame using matched keyframe pose
         Eigen::Affine3f initGuess = pclPointToAffine3f(cloudKeyPoses6D->points[matchedKey]);
@@ -2145,6 +2175,26 @@ public:
             }
 
             aLoopIsClosed = false;
+
+            // Force scan-to-map KD-tree rebuild on next frame with corrected submap
+            lastCornerMapSize = 0;
+            lastSurfMapSize   = 0;
+
+            // Rebuild cache for nearby keyframes immediately so next frame avoids spike
+            {
+                std::vector<int> searchInd;
+                std::vector<float> searchDis;
+                kdtreeSurroundingKeyPoses->setInputCloud(cloudKeyPoses3D);
+                lastKdtreePoseSize = cloudKeyPoses3D->size();
+                kdtreeSurroundingKeyPoses->radiusSearch(cloudKeyPoses3D->back(),
+                    (double)surroundingKeyframeSearchRadius, searchInd, searchDis);
+                for (int idx : searchInd)
+                {
+                    pcl::PointCloud<PointType> cornerTemp = *transformPointCloud(cornerCloudKeyFrames[idx], &cloudKeyPoses6D->points[idx]);
+                    pcl::PointCloud<PointType> surfTemp   = *transformPointCloud(surfCloudKeyFrames[idx],   &cloudKeyPoses6D->points[idx]);
+                    laserCloudMapContainer[idx] = make_pair(cornerTemp, surfTemp);
+                }
+            }
         }
     }
 
