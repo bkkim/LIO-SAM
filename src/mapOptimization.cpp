@@ -236,7 +236,14 @@ public:
                 std::string filename = saveDataPath + "KeyPointCloud_" + std::string(szBuf) + ".pcd"; 
                 pcl::io::savePCDFileASCII (filename, *transform_cloud);
             }
-        }    
+        }
+
+        if (saveDBoWFlag && !cloudKeyPoses3D->empty())
+        {
+            pcl::io::savePCDFileBinary(saveDataPath + "trajectory.pcd",      *cloudKeyPoses3D);
+            pcl::io::savePCDFileBinary(saveDataPath + "transformations.pcd",  *cloudKeyPoses6D);
+            ROS_INFO("[Map Save] Saved %d poses to %s", (int)cloudKeyPoses3D->size(), saveDataPath.c_str());
+        }
     }
 
     void allocateMemory()
@@ -2059,6 +2066,7 @@ public:
                 // Save corner/surf keyframe clouds for map reuse (local frame, binary)
                 pcl::io::savePCDFileBinary(saveDataPath + "corner_" + std::string(szBuf) + ".pcd", *thisCornerKeyFrame);
                 pcl::io::savePCDFileBinary(saveDataPath + "surf_"   + std::string(szBuf) + ".pcd", *thisSurfKeyFrame);
+
             }
 
             // Save the keyframe descriptors.
