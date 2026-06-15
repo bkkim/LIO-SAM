@@ -89,7 +89,7 @@ lio_sam:
   surroundingKeyframeSearchRadius: 10.0         # meters, within n meters scan-to-map optimization (when loop closure disabled)
 
   # Loop closure
-  loopClosureEnableFlag: false
+  loopClosureEnableFlag: true
   loopClosureFrequency: 1.0                     # Hz, regulate loop closure constraint add frequency
   surroundingKeyframeSize: 50                   # submap size (when loop closure enabled)
   historyKeyframeSearchRadius: 15.0             # meters, key frame that is within n meters from current pose will be considered for loop closure
@@ -98,9 +98,9 @@ lio_sam:
   historyKeyframeFitnessScore: 0.3              # icp threshold, the smaller the better alignment
   
   # DBoW Loop closure (kbk)
-  saveKeyframeFlag: true                       # keyframe pointcloud data
+  saveKeyframeFlag: false                       # keyframe pointcloud data
   saveIcpframeFlag: false                       # icp result pointcloud between current and keyframe
-  saveDBoWFlag: true                           # keyframe image & dbow3 search result image between current and keyframe
+  saveDBoWFlag: false                           # keyframe image & dbow3 search result image between current and keyframe
   loopClosureType: 1                            # 0 : distance (original), 1 : DBoW (kbk)
   keyframeType: 1                               # 0 : only use pose6d, 1 : duration between current and prev keyframe (1 second)
   keyframeSearchGap: 10 #20                     # DBoW Search Duration
@@ -110,7 +110,7 @@ lio_sam:
   saveDataPath: "/home/wave/2026_workspace/liosam_keyframes/"
 
   # Map reuse
-  loadMapFlag: false                             # load existing map for relocalization
+  loadMapFlag: true                             # load existing map for relocalization
   loadMapPath: "/home/wave/2026_workspace/liosam_keyframes/"  # path to saved map directory
 
   # Debug Log
