@@ -216,8 +216,8 @@ public:
         downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
         downSizeFilterICP.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
         // submap filters: 4x coarser than per-frame filters to keep scan-to-map fast
-        downSizeFilterCornerMap.setLeafSize(mappingCornerLeafSize * 4, mappingCornerLeafSize * 4, mappingCornerLeafSize * 4);
-        downSizeFilterSurfMap.setLeafSize(mappingSurfLeafSize * 4,   mappingSurfLeafSize * 4,   mappingSurfLeafSize * 4);
+        downSizeFilterCornerMap.setLeafSize(mappingCornerLeafSize * 1, mappingCornerLeafSize * 1, mappingCornerLeafSize * 1);
+        downSizeFilterSurfMap.setLeafSize(mappingSurfLeafSize * 1,   mappingSurfLeafSize * 1,   mappingSurfLeafSize * 1);
         downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
 
         allocateMemory();
@@ -341,8 +341,11 @@ public:
                 auto tr1 = std::chrono::high_resolution_clock::now();
                 tryRelocalize();
                 auto tr2 = std::chrono::high_resolution_clock::now();
-                if (moTime) {
-                    auto ms = [](auto a, auto b){ return std::chrono::duration_cast<std::chrono::milliseconds>(b-a).count(); };
+                if (moTime) 
+                {
+                    auto ms = [](auto a, auto b){ 
+                        return std::chrono::duration_cast<std::chrono::milliseconds>(b-a).count(); 
+                    };
                     std::cout << "  [reloc] downsample=" << ms(tr0,tr1)
                               << " tryRelocalize=" << ms(tr1,tr2) << " ms" << std::endl;
                 }
@@ -361,8 +364,11 @@ public:
             saveKeyFramesAndFactor();
             auto t4 = std::chrono::high_resolution_clock::now();
 
-            if (moTime) {
-                auto ms = [](auto a, auto b){ return std::chrono::duration_cast<std::chrono::milliseconds>(b-a).count(); };
+            if (moTime) 
+            {
+                auto ms = [](auto a, auto b) { 
+                    return std::chrono::duration_cast<std::chrono::milliseconds>(b-a).count(); 
+                };
                 std::cout << "  [breakdown] extract=" << ms(t0,t1)
                           << " downsample=" << ms(t1,t2)
                           << " scan2map=" << ms(t2,t3)
@@ -381,7 +387,7 @@ public:
             totalCnt ++;
             auto avg = std::chrono::milliseconds(totalTime.count()/totalCnt);
             if (moTime)
-            std::cout << "mapOptimization::laserCloudInfoHandler() : " << duration.count() << " ms" << ", Avg : " << avg.count() << " ms" << std::endl;
+                std::cout << "mapOptimization::laserCloudInfoHandler() : " << duration.count() << " ms" << ", Avg : " << avg.count() << " ms" << std::endl;
         }
 
         
@@ -609,9 +615,44 @@ public:
 
 
 
+    // kbk
+    void placeRecognitionThread()
+    {
+        if (placeRecognitionEnableFlag == false)
+            return;
+        
+        ros::Rate rate(loopClosureFrequency);
+        while (ros::ok())
+        {
+            rate.sleep();
+            performPlaceRecognition();
+        }
+    }
 
+    void performPlaceRecognition() 
+    {
+        if (cloudKeyPoses3D->points.empty() == true)
+            return;
+        mtx.lock();
+        *copy_cloudKeyPoses3D = *cloudKeyPoses3D;
+        *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
+        mtx.unlock();
+        // find keys
+        int prKeyCur;
+        int prKeyPre;
+        float score;
+        
+        if (detectPrevMapDBow(&prKeyCur, &prKeyPre, &score) == false)
+            return;
 
-
+        pcl::PointCloud<PointType>::Ptr curKeyframeCloud(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<PointType>::Ptr preKeyframeCloud(new pcl::PointCloud<PointType>());
+        {
+            prFindNearKeyframes(curKeyframeCloud, prKeyCur, 0);
+            prFindNearKeyframes(preKeyframeCloud, prKeyPre, historyKeyframeSearchNum);
+            if (curKeyframeCloud->size() < 300 || )
+        }
+    }
 
 
 
@@ -1637,21 +1678,29 @@ public:
 
     cv::Mat computeDescriptorFromCloud(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud)
     {
-        if (!cloud || cloud->empty()) return cv::Mat();
+        if (!cloud || cloud->empty()) 
+            return cv::Mat();
+        
         size_t width = cloud->width, height = cloud->height;
-        if (width < 2 || height < 2) return cv::Mat();
+        
+        if (width < 2 || height < 2) 
+            return cv::Mat();
 
         vector<float> diffs;
         const float thres_h = 0.3f, thres_v = 0.3f;
-        for (size_t v = 0; v < height - 1; v++) {
-            for (size_t u = 0; u < width - 1; u++) {
+        for (size_t v = 0; v < height - 1; v++) 
+        {
+            for (size_t u = 0; u < width - 1; u++) 
+            {
                 pcl::PointXYZRGB pc = cloud->points[v * width + u];
                 pcl::PointXYZRGB pr = cloud->points[v * width + (u + 1)];
                 pcl::PointXYZRGB pb = cloud->points[(v + 1) * width + u];
                 float rc = range(pc), rr = range(pr), rb = range(pb);
-                if (rc != 0 && rr != 0 && rb != 0) {
+                if (rc != 0 && rr != 0 && rb != 0) 
+                {
                     float dh = rc - rr, dv = rc - rb;
-                    if (std::abs(dh) > thres_h && std::abs(dv) > thres_v) {
+                    if (std::abs(dh) > thres_h && std::abs(dv) > thres_v) 
+                    {
                         diffs.push_back(rc);
                         diffs.push_back(dh);
                         diffs.push_back(dv);
@@ -1659,41 +1708,53 @@ public:
                 }
             }
         }
-        if (diffs.size() < 3) return cv::Mat();
+        if (diffs.size() < 3) 
+            return cv::Mat();
+
         return cv::Mat(diffs.size() / 3, 3, CV_32F, diffs.data()).clone();
     }
 
+
     void loadExistingMap()
     {
-        if (!loadMapFlag) return;
+        if (!loadMapFlag) 
+            return;
 
         // Load poses
         if (pcl::io::loadPCDFile<PointType>(loadMapPath + "trajectory.pcd", *cloudKeyPoses3D) < 0 ||
-            pcl::io::loadPCDFile<PointTypePose>(loadMapPath + "transformations.pcd", *cloudKeyPoses6D) < 0) {
+            pcl::io::loadPCDFile<PointTypePose>(loadMapPath + "transformations.pcd", *cloudKeyPoses6D) < 0) 
+        {
             ROS_WARN("[Map Load] Failed to load poses from %s", loadMapPath.c_str());
             return;
         }
 
         int N = (int)cloudKeyPoses3D->size();
-        if (N == 0) { ROS_WARN("[Map Load] Empty pose file"); return; }
+        if (N == 0) 
+        { 
+            ROS_WARN("[Map Load] Empty pose file"); 
+            return; 
+        }
         ROS_INFO("[Map Load] Loading %d keyframes from %s", N, loadMapPath.c_str());
 
         // Load per-keyframe corner/surf clouds
         int loadedClouds = 0;
-        for (int i = 0; i < N; i++) {
+        for (int i = 0; i < N; i++) 
+        {
             pcl::PointCloud<PointType>::Ptr corner(new pcl::PointCloud<PointType>());
             pcl::PointCloud<PointType>::Ptr surf(new pcl::PointCloud<PointType>());
             char szBuf[128];
             sprintf(szBuf, "%04d", i);
             bool ok = true;
-            if (pcl::io::loadPCDFile<PointType>(loadMapPath + "corner_" + szBuf + ".pcd", *corner) < 0) ok = false;
-            if (pcl::io::loadPCDFile<PointType>(loadMapPath + "surf_"   + szBuf + ".pcd", *surf)   < 0) ok = false;
+            if (pcl::io::loadPCDFile<PointType>(loadMapPath + "corner_" + szBuf + ".pcd", *corner) < 0) 
+                ok = false;
+            if (pcl::io::loadPCDFile<PointType>(loadMapPath + "surf_"   + szBuf + ".pcd", *surf)   < 0) 
+                ok = false;
             cornerCloudKeyFrames.push_back(corner);
             surfCloudKeyFrames.push_back(surf);
             if (ok) loadedClouds++;
         }
         ROS_INFO("[Map Load] Loaded %d/%d keyframe clouds", loadedClouds, N);
-
+/*
         // Initialize GTSAM factor graph with loaded poses
         noiseModel::Diagonal::shared_ptr priorNoise   = noiseModel::Diagonal::Variances(
             (Vector(6) << 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6).finished());
@@ -1702,7 +1763,8 @@ public:
 
         gtSAMgraph.add(PriorFactor<Pose3>(0, pclPointTogtsamPose3(cloudKeyPoses6D->points[0]), priorNoise));
         initialEstimate.insert(0, pclPointTogtsamPose3(cloudKeyPoses6D->points[0]));
-        for (int i = 1; i < N; i++) {
+        for (int i = 1; i < N; i++) 
+        {
             gtsam::Pose3 pFrom = pclPointTogtsamPose3(cloudKeyPoses6D->points[i - 1]);
             gtsam::Pose3 pTo   = pclPointTogtsamPose3(cloudKeyPoses6D->points[i]);
             gtSAMgraph.add(BetweenFactor<Pose3>(i - 1, i, pFrom.between(pTo), betweenNoise));
@@ -1713,19 +1775,21 @@ public:
         gtSAMgraph.resize(0);
         initialEstimate.clear();
         isamCurrentEstimate = isam->calculateEstimate();
-
+*/
         // Rebuild visualization path
         for (int i = 0; i < N; i++)
             updatePath(cloudKeyPoses6D->points[i]);
 
         // Load DBoW descriptors and rebuild database
         int loadedDesc = 0;
-        for (int i = 0; i < N; i++) {
+        for (int i = 0; i < N; i++) 
+        {
             char szBuf[128];
             sprintf(szBuf, "%04d", i);
             cv::FileStorage fs(loadMapPath + "desc_" + szBuf + ".yml", cv::FileStorage::READ);
             cv::Mat desc;
-            if (fs.isOpened()) {
+            if (fs.isOpened()) 
+            {
                 fs["descriptor"] >> desc;
                 fs.release();
                 loadedDesc++;
@@ -1744,15 +1808,18 @@ public:
 
     void tryRelocalize()
     {
-        if (!laserCloudMlx || laserCloudMlx->empty()) return;
+        if (!laserCloudMlx || laserCloudMlx->empty()) 
+            return;
 
         cv::Mat curDesc = computeDescriptorFromCloud(laserCloudMlx);
-        if (curDesc.empty()) return;
+        if (curDesc.empty()) 
+            return;
 
         QueryResults results;
         dbowDb.query(curDesc, results, 1);
 
-        if (results.empty() || results[0].Score < dbowMinScore) {
+        if (results.empty() || results[0].Score < dbowMinScore) 
+        {
             ROS_INFO_THROTTLE(2.0, "[Relocalize] Searching... best score: %.3f (need %.3f)",
                               results.empty() ? 0.0f : (float)results[0].Score, (float)dbowMinScore);
             return;
@@ -1768,13 +1835,21 @@ public:
         *currentScan += *laserCloudSurfLastDS;
         ROS_INFO("[Relocalize] currentScan size: %d (corner=%d surf=%d)",
                  (int)currentScan->size(), laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
-        if ((int)currentScan->size() < 300) { ROS_WARN("[Relocalize] currentScan too small (<300), skip"); return; }
+        if ((int)currentScan->size() < 300) 
+        { 
+            ROS_WARN("[Relocalize] currentScan too small (<300), skip"); 
+            return; 
+        }
 
         // Build reference cloud from matched keyframe neighborhood (world frame)
         pcl::PointCloud<PointType>::Ptr refCloud(new pcl::PointCloud<PointType>());
         loopFindNearKeyframes(refCloud, matchedKey, historyKeyframeSearchNum);
         ROS_INFO("[Relocalize] refCloud size: %d", (int)refCloud->size());
-        if ((int)refCloud->size() < 1000) { ROS_WARN("[Relocalize] refCloud too small (<1000), skip"); return; }
+        if ((int)refCloud->size() < 1000) 
+        { 
+            ROS_WARN("[Relocalize] refCloud too small (<1000), skip"); 
+            return; 
+        }
 
         // Transform current scan to approximate world frame using matched keyframe pose
         Eigen::Affine3f initGuess = pclPointToAffine3f(cloudKeyPoses6D->points[matchedKey]);
@@ -1792,7 +1867,8 @@ public:
         pcl::PointCloud<PointType>::Ptr unused(new pcl::PointCloud<PointType>());
         gicp.align(*unused);
 
-        if (!gicp.hasConverged() || gicp.getFitnessScore() > historyKeyframeFitnessScore) {
+        if (!gicp.hasConverged() || gicp.getFitnessScore() > historyKeyframeFitnessScore) 
+        {
             ROS_WARN("[Relocalize] GICP failed (converged=%d, score=%.4f)",
                      (int)gicp.hasConverged(), (float)gicp.getFitnessScore());
             return;
@@ -1815,6 +1891,10 @@ public:
         isRelocalized = true;
         ROS_INFO("[Relocalize] SUCCESS! Pose (%.2f, %.2f, %.2f) yaw=%.2f, GICP score=%.4f",
                  x, y, z, yaw, (float)gicp.getFitnessScore());
+
+        // kbk 20260706
+        // Map based place recognition thread start!
+        std::thread prthread(&mapOptimization::placeRecognitionThread, this);
     }
 
     // -----------------------------------------------------------------------
