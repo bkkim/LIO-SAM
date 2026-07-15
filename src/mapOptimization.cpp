@@ -171,10 +171,21 @@ public:
     vector<pcl::PointCloud<pcl::PointXYZRGB>::Ptr> keyFrameMlx;
     vector<cv::Mat> keyFrameDescriptors; // keyframe descriptors
 
-    // Map reuse members
-    bool mapLoaded = false;
-    bool isRelocalized = false;
-    int  priorKeyframeCount = 0;
+    // Map reuse members — prior map kept separate, never inserted into GTSAM
+    bool mapLoaded    = false;
+    bool isRelocalized = false;  // true after initial pose fixed from prior map
+    pcl::PointCloud<PointType>::Ptr     priorPoses3D;
+    pcl::PointCloud<PointTypePose>::Ptr priorPoses6D;
+    vector<pcl::PointCloud<PointType>::Ptr> priorCornerClouds;
+    vector<pcl::PointCloud<PointType>::Ptr> priorSurfClouds;
+    Database     priorDb;
+    vector<cv::Mat> priorDescriptors;
+
+    // PriorFactor queue from map-based loop closure (GPS-like)
+    vector<int>                                     loopPriorIndexQueue;
+    vector<gtsam::Pose3>                            loopPriorPoseQueue;
+    vector<gtsam::noiseModel::Diagonal::shared_ptr> loopPriorNoiseQueue;
+    map<int, int> priorLoopIndexContainer;
 
     size_t lastKdtreePoseSize = 0;
     size_t lastCornerMapSize  = 0;
@@ -216,8 +227,8 @@ public:
         downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
         downSizeFilterICP.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
         // submap filters: 4x coarser than per-frame filters to keep scan-to-map fast
-        downSizeFilterCornerMap.setLeafSize(mappingCornerLeafSize * 4, mappingCornerLeafSize * 4, mappingCornerLeafSize * 4);
-        downSizeFilterSurfMap.setLeafSize(mappingSurfLeafSize * 4,   mappingSurfLeafSize * 4,   mappingSurfLeafSize * 4);
+        downSizeFilterCornerMap.setLeafSize(mappingCornerLeafSize * 1, mappingCornerLeafSize * 1, mappingCornerLeafSize * 1);
+        downSizeFilterSurfMap.setLeafSize(mappingSurfLeafSize * 1,   mappingSurfLeafSize * 1,   mappingSurfLeafSize * 1);
         downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
 
         allocateMemory();
@@ -262,6 +273,9 @@ public:
         copy_cloudKeyPoses3D.reset(new pcl::PointCloud<PointType>());
         copy_cloudKeyPoses6D.reset(new pcl::PointCloud<PointTypePose>());
 
+        priorPoses3D.reset(new pcl::PointCloud<PointType>());
+        priorPoses6D.reset(new pcl::PointCloud<PointTypePose>());
+
         kdtreeSurroundingKeyPoses.reset(new pcl::KdTreeFLANN<PointType>());
         kdtreeHistoryKeyPoses.reset(new pcl::KdTreeFLANN<PointType>());
 
@@ -302,6 +316,7 @@ public:
         // DBoW vocabulary load
         dbowVoc.load(dbowVocPath);
         dbowDb.setVocabulary(dbowVoc, false, 0);
+        priorDb.setVocabulary(dbowVoc, false, 0);
         ROS_INFO("!!!!dbow3 test!!!!");
 
         totalTime = std::chrono::milliseconds::zero();
@@ -333,19 +348,11 @@ public:
         
             timeLastProcessing = timeLaserInfoCur;
 
-            // Map reuse: attempt relocalization until succeeded
+            // Prior map: hold normal SLAM until initial pose is fixed from prior map
             if (mapLoaded && !isRelocalized)
             {
-                auto tr0 = std::chrono::high_resolution_clock::now();
                 downsampleCurrentScan();
-                auto tr1 = std::chrono::high_resolution_clock::now();
                 tryRelocalize();
-                auto tr2 = std::chrono::high_resolution_clock::now();
-                if (moTime) {
-                    auto ms = [](auto a, auto b){ return std::chrono::duration_cast<std::chrono::milliseconds>(b-a).count(); };
-                    std::cout << "  [reloc] downsample=" << ms(tr0,tr1)
-                              << " tryRelocalize=" << ms(tr1,tr2) << " ms" << std::endl;
-                }
                 return;
             }
 
@@ -619,14 +626,17 @@ public:
 
     void loopClosureThread()
     {
-        if (loopClosureEnableFlag == false)
+        if (!loopClosureEnableFlag && !mapLoopClosureEnableFlag)
             return;
 
         ros::Rate rate(loopClosureFrequency);
         while (ros::ok())
         {
             rate.sleep();
-            performLoopClosure();
+            if (loopClosureEnableFlag)
+                performLoopClosure();          // intra-session: BetweenFactor
+            if (mapLoopClosureEnableFlag)
+                performMapBasedLoopClosure();  // map-based: PriorFactor (GPS-like)
             visualizeLoopClosure();
         }
     }
@@ -1667,121 +1677,134 @@ public:
     {
         if (!loadMapFlag) return;
 
-        // Load poses
-        if (pcl::io::loadPCDFile<PointType>(loadMapPath + "trajectory.pcd", *cloudKeyPoses3D) < 0 ||
-            pcl::io::loadPCDFile<PointTypePose>(loadMapPath + "transformations.pcd", *cloudKeyPoses6D) < 0) {
+        // Load poses into prior containers (NOT the current session's cloudKeyPoses)
+        if (pcl::io::loadPCDFile<PointType>(loadMapPath + "trajectory.pcd", *priorPoses3D) < 0 ||
+            pcl::io::loadPCDFile<PointTypePose>(loadMapPath + "transformations.pcd", *priorPoses6D) < 0)
+        {
             ROS_WARN("[Map Load] Failed to load poses from %s", loadMapPath.c_str());
             return;
         }
 
-        int N = (int)cloudKeyPoses3D->size();
-        if (N == 0) { ROS_WARN("[Map Load] Empty pose file"); return; }
+        int N = (int)priorPoses3D->size();
+        if (N == 0)
+        {
+            ROS_WARN("[Map Load] Empty pose file");
+            return;
+        }
         ROS_INFO("[Map Load] Loading %d keyframes from %s", N, loadMapPath.c_str());
 
-        // Load per-keyframe corner/surf clouds
+        // Load per-keyframe corner/surf clouds into prior containers (NOT current session)
         int loadedClouds = 0;
-        for (int i = 0; i < N; i++) {
+        for (int i = 0; i < N; i++)
+        {
             pcl::PointCloud<PointType>::Ptr corner(new pcl::PointCloud<PointType>());
             pcl::PointCloud<PointType>::Ptr surf(new pcl::PointCloud<PointType>());
             char szBuf[128];
             sprintf(szBuf, "%04d", i);
             bool ok = true;
-            if (pcl::io::loadPCDFile<PointType>(loadMapPath + "corner_" + szBuf + ".pcd", *corner) < 0) ok = false;
-            if (pcl::io::loadPCDFile<PointType>(loadMapPath + "surf_"   + szBuf + ".pcd", *surf)   < 0) ok = false;
-            cornerCloudKeyFrames.push_back(corner);
-            surfCloudKeyFrames.push_back(surf);
+            if (pcl::io::loadPCDFile<PointType>(loadMapPath + "corner_" + szBuf + ".pcd", *corner) < 0)
+                ok = false;
+            if (pcl::io::loadPCDFile<PointType>(loadMapPath + "surf_"   + szBuf + ".pcd", *surf)   < 0)
+                ok = false;
+            priorCornerClouds.push_back(corner);
+            priorSurfClouds.push_back(surf);
             if (ok) loadedClouds++;
         }
         ROS_INFO("[Map Load] Loaded %d/%d keyframe clouds", loadedClouds, N);
 
-        // Initialize GTSAM factor graph with loaded poses
-        noiseModel::Diagonal::shared_ptr priorNoise   = noiseModel::Diagonal::Variances(
-            (Vector(6) << 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6).finished());
-        noiseModel::Diagonal::shared_ptr betweenNoise = noiseModel::Diagonal::Variances(
-            (Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
-
-        gtSAMgraph.add(PriorFactor<Pose3>(0, pclPointTogtsamPose3(cloudKeyPoses6D->points[0]), priorNoise));
-        initialEstimate.insert(0, pclPointTogtsamPose3(cloudKeyPoses6D->points[0]));
-        for (int i = 1; i < N; i++) {
-            gtsam::Pose3 pFrom = pclPointTogtsamPose3(cloudKeyPoses6D->points[i - 1]);
-            gtsam::Pose3 pTo   = pclPointTogtsamPose3(cloudKeyPoses6D->points[i]);
-            gtSAMgraph.add(BetweenFactor<Pose3>(i - 1, i, pFrom.between(pTo), betweenNoise));
-            initialEstimate.insert(i, pTo);
-        }
-        isam->update(gtSAMgraph, initialEstimate);
-        isam->update();
-        gtSAMgraph.resize(0);
-        initialEstimate.clear();
-        isamCurrentEstimate = isam->calculateEstimate();
-
-        // Rebuild visualization path
-        for (int i = 0; i < N; i++)
-            updatePath(cloudKeyPoses6D->points[i]);
-
-        // Load DBoW descriptors and rebuild database
+        // Load DBoW descriptors into prior database (separate from current session dbowDb)
         int loadedDesc = 0;
-        for (int i = 0; i < N; i++) {
+        for (int i = 0; i < N; i++)
+        {
             char szBuf[128];
             sprintf(szBuf, "%04d", i);
             cv::FileStorage fs(loadMapPath + "desc_" + szBuf + ".yml", cv::FileStorage::READ);
             cv::Mat desc;
-            if (fs.isOpened()) {
+            if (fs.isOpened())
+            {
                 fs["descriptor"] >> desc;
                 fs.release();
                 loadedDesc++;
             }
-            keyFrameDescriptors.push_back(desc);
+            priorDescriptors.push_back(desc);
             if (!desc.empty())
-                dbowDb.add(desc);
+                priorDb.add(desc);
         }
         ROS_INFO("[Map Load] Loaded %d/%d DBoW descriptors", loadedDesc, N);
 
-        priorKeyframeCount = N;
-        mapLoaded = true;
+        // Prior map is NOT inserted into GTSAM — used only as fixed reference for PriorFactor
+        mapLoaded     = true;
         isRelocalized = false;
-        ROS_INFO("[Map Load] Map loaded. Waiting for relocalization...");
+        ROS_INFO("[Map Load] Map loaded (%d keyframes). Waiting for initial relocalization...", N);
     }
 
+    // Build submap from prior map keyframes (in prior-map world frame)
+    void loopFindNearKeyframesFromPrior(pcl::PointCloud<PointType>::Ptr& nearKeyframes,
+                                        const int& key, const int& searchNum)
+    {
+        nearKeyframes->clear();
+        int cloudSize = (int)priorPoses6D->size();
+        for (int i = -searchNum; i <= searchNum; ++i)
+        {
+            int keyNear = key + i;
+            if (keyNear < 0 || keyNear >= cloudSize) continue;
+            *nearKeyframes += *transformPointCloud(priorCornerClouds[keyNear], &priorPoses6D->points[keyNear]);
+            *nearKeyframes += *transformPointCloud(priorSurfClouds[keyNear],   &priorPoses6D->points[keyNear]);
+        }
+        if (nearKeyframes->empty()) return;
+        pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
+        downSizeFilterICP.setInputCloud(nearKeyframes);
+        downSizeFilterICP.filter(*cloud_temp);
+        *nearKeyframes = *cloud_temp;
+    }
+
+    // Initial relocalization: run before first keyframe is saved.
+    // Sets transformTobeMapped to the correct prior-map pose so the first keyframe
+    // is inserted into GTSAM at the right position.
     void tryRelocalize()
     {
-        if (!laserCloudMlx || laserCloudMlx->empty()) return;
-
         cv::Mat curDesc = computeDescriptorFromCloud(laserCloudMlx);
         if (curDesc.empty()) return;
 
         QueryResults results;
-        dbowDb.query(curDesc, results, 1);
+        priorDb.query(curDesc, results, 1);
 
-        if (results.empty() || results[0].Score < dbowMinScore) {
-            ROS_INFO_THROTTLE(2.0, "[Relocalize] Searching... best score: %.3f (need %.3f)",
+        if (results.empty() || results[0].Score < dbowMinScore)
+        {
+            ROS_INFO_THROTTLE(2.0, "[Relocalize] Searching prior map... best score: %.3f (need %.3f)",
                               results.empty() ? 0.0f : (float)results[0].Score, (float)dbowMinScore);
             return;
         }
 
         int   matchedKey = results[0].Id;
         float score      = results[0].Score;
-        ROS_INFO("[Relocalize] DBoW match: keyframe %d, score %.3f. Running GICP...", matchedKey, score);
+        ROS_INFO("[Relocalize] DBoW match: prior key %d, score %.3f. Running GICP...", matchedKey, score);
 
-        // Build current scan cloud (local frame)
+        // Current scan in local sensor frame
         pcl::PointCloud<PointType>::Ptr currentScan(new pcl::PointCloud<PointType>());
         *currentScan += *laserCloudCornerLastDS;
         *currentScan += *laserCloudSurfLastDS;
-        ROS_INFO("[Relocalize] currentScan size: %d (corner=%d surf=%d)",
-                 (int)currentScan->size(), laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
-        if ((int)currentScan->size() < 300) { ROS_WARN("[Relocalize] currentScan too small (<300), skip"); return; }
+        if ((int)currentScan->size() < 300)
+        {
+            ROS_WARN("[Relocalize] Current scan too small (%d), skip", (int)currentScan->size());
+            return;
+        }
 
-        // Build reference cloud from matched keyframe neighborhood (world frame)
+        // Prior submap in prior-map world frame
         pcl::PointCloud<PointType>::Ptr refCloud(new pcl::PointCloud<PointType>());
-        loopFindNearKeyframes(refCloud, matchedKey, historyKeyframeSearchNum);
-        ROS_INFO("[Relocalize] refCloud size: %d", (int)refCloud->size());
-        if ((int)refCloud->size() < 1000) { ROS_WARN("[Relocalize] refCloud too small (<1000), skip"); return; }
+        loopFindNearKeyframesFromPrior(refCloud, matchedKey, historyKeyframeSearchNum);
+        if ((int)refCloud->size() < 1000)
+        {
+            ROS_WARN("[Relocalize] Prior submap too small (%d), skip", (int)refCloud->size());
+            return;
+        }
 
-        // Transform current scan to approximate world frame using matched keyframe pose
-        Eigen::Affine3f initGuess = pclPointToAffine3f(cloudKeyPoses6D->points[matchedKey]);
+        // Bring current scan to approximate prior-map world frame using matched prior pose
+        Eigen::Affine3f initGuess = pclPointToAffine3f(priorPoses6D->points[matchedKey]);
         pcl::PointCloud<PointType>::Ptr currentScanInWorld(new pcl::PointCloud<PointType>());
         pcl::transformPointCloud(*currentScan, *currentScanInWorld, initGuess);
 
-        // GICP alignment
+        // GICP refinement
         pcl::GeneralizedIterativeClosestPoint<PointType, PointType> gicp;
         gicp.setMaxCorrespondenceDistance(historyKeyframeSearchRadius * 2);
         gicp.setMaximumIterations(100);
@@ -1792,13 +1815,14 @@ public:
         pcl::PointCloud<PointType>::Ptr unused(new pcl::PointCloud<PointType>());
         gicp.align(*unused);
 
-        if (!gicp.hasConverged() || gicp.getFitnessScore() > historyKeyframeFitnessScore) {
+        if (!gicp.hasConverged() || gicp.getFitnessScore() > historyKeyframeFitnessScore)
+        {
             ROS_WARN("[Relocalize] GICP failed (converged=%d, score=%.4f)",
                      (int)gicp.hasConverged(), (float)gicp.getFitnessScore());
             return;
         }
 
-        // Final pose in world frame: T_gicp_refinement * T_initGuess
+        // Final pose in prior-map world frame
         Eigen::Affine3f relocPose;
         relocPose.matrix() = gicp.getFinalTransformation() * initGuess.matrix();
 
@@ -1813,8 +1837,118 @@ public:
         transformTobeMapped[5] = z;
 
         isRelocalized = true;
-        ROS_INFO("[Relocalize] SUCCESS! Pose (%.2f, %.2f, %.2f) yaw=%.2f, GICP score=%.4f",
+        ROS_INFO("[Relocalize] SUCCESS! Pose (%.2f, %.2f, %.2f) yaw=%.2f, score=%.4f",
                  x, y, z, yaw, (float)gicp.getFitnessScore());
+    }
+
+    // Map-based loop closure: query priorDb, GICP, add PriorFactor (GPS-like)
+    void performMapBasedLoopClosure()
+    {
+        if (!mapLoaded || !isRelocalized) return;
+        if (cloudKeyPoses3D->points.empty()) return;
+
+        mtx.lock();
+        *copy_cloudKeyPoses3D = *cloudKeyPoses3D;
+        *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
+        mtx.unlock();
+
+        int loopKeyCur = (int)copy_cloudKeyPoses3D->size() - 1;
+        if (loopKeyCur < 0) return;
+
+        // Skip if this keyframe already has a map-based constraint
+        if (priorLoopIndexContainer.count(loopKeyCur)) return;
+
+        // Need descriptor for current keyframe
+        cv::Mat curDesc;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (loopKeyCur >= (int)keyFrameDescriptors.size()) return;
+            curDesc = keyFrameDescriptors[loopKeyCur];
+        }
+        if (curDesc.empty()) return;
+
+        // Query prior map database
+        QueryResults results;
+        priorDb.query(curDesc, results, 1);
+        if (results.empty() || results[0].Score < dbowMinScore)
+        {
+            ROS_INFO_THROTTLE(2.0, "[MapLoop] Searching prior map... best score: %.3f (need %.3f)",
+                              results.empty() ? 0.0f : (float)results[0].Score, (float)dbowMinScore);
+            return;
+        }
+
+        int   matchedPriorKey = results[0].Id;
+        float score           = results[0].Score;
+        ROS_INFO("[MapLoop] DBoW match: new-session key %d -> prior key %d (score %.3f). Running GICP...",
+                 loopKeyCur, matchedPriorKey, score);
+
+        // Current keyframe cloud in its LOCAL sensor frame
+        pcl::PointCloud<PointType>::Ptr curLocal(new pcl::PointCloud<PointType>());
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (loopKeyCur >= (int)cornerCloudKeyFrames.size()) return;
+            *curLocal += *cornerCloudKeyFrames[loopKeyCur];
+            *curLocal += *surfCloudKeyFrames[loopKeyCur];
+        }
+        if ((int)curLocal->size() < 300)
+        {
+            ROS_WARN("[MapLoop] Current keyframe cloud too small (%d), skip", (int)curLocal->size());
+            return;
+        }
+
+        // Prior submap in prior-map world frame
+        pcl::PointCloud<PointType>::Ptr priorSubmap(new pcl::PointCloud<PointType>());
+        loopFindNearKeyframesFromPrior(priorSubmap, matchedPriorKey, historyKeyframeSearchNum);
+        if ((int)priorSubmap->size() < 1000)
+        {
+            ROS_WARN("[MapLoop] Prior submap too small (%d), skip", (int)priorSubmap->size());
+            return;
+        }
+
+        // Bring current scan into approximate prior-map world frame using matched prior pose
+        Eigen::Affine3f initGuess = pclPointToAffine3f(priorPoses6D->points[matchedPriorKey]);
+        pcl::PointCloud<PointType>::Ptr curInPriorWorld(new pcl::PointCloud<PointType>());
+        pcl::transformPointCloud(*curLocal, *curInPriorWorld, initGuess);
+
+        // GICP refinement
+        pcl::GeneralizedIterativeClosestPoint<PointType, PointType> gicp;
+        gicp.setMaxCorrespondenceDistance(historyKeyframeSearchRadius * 2);
+        gicp.setMaximumIterations(100);
+        gicp.setTransformationEpsilon(1e-6);
+        gicp.setEuclideanFitnessEpsilon(1e-6);
+        gicp.setInputSource(curInPriorWorld);
+        gicp.setInputTarget(priorSubmap);
+        pcl::PointCloud<PointType>::Ptr unused(new pcl::PointCloud<PointType>());
+        gicp.align(*unused);
+
+        if (!gicp.hasConverged() || gicp.getFitnessScore() > historyKeyframeFitnessScore)
+        {
+            ROS_WARN("[MapLoop] GICP failed (converged=%d, score=%.4f)",
+                     (int)gicp.hasConverged(), (float)gicp.getFitnessScore());
+            return;
+        }
+
+        // Corrected pose of loopKeyCur in prior-map world frame: T_gicp * T_initGuess
+        Eigen::Affine3f tCorrect;
+        tCorrect.matrix() = gicp.getFinalTransformation() * initGuess.matrix();
+        float x, y, z, roll, pitch, yaw;
+        pcl::getTranslationAndEulerAngles(tCorrect, x, y, z, roll, pitch, yaw);
+        gtsam::Pose3 correctedPose = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
+
+        float noiseScore = gicp.getFitnessScore();
+        gtsam::Vector Vector6(6);
+        Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore, noiseScore;
+        auto constraintNoise = noiseModel::Diagonal::Variances(Vector6);
+
+        mtx.lock();
+        loopPriorIndexQueue.push_back(loopKeyCur);
+        loopPriorPoseQueue.push_back(correctedPose);
+        loopPriorNoiseQueue.push_back(constraintNoise);
+        priorLoopIndexContainer[loopKeyCur] = matchedPriorKey;
+        mtx.unlock();
+
+        ROS_INFO("[MapLoop] PriorFactor queued: new-session key %d -> prior pose (%.2f, %.2f, %.2f), score=%.4f",
+                 loopKeyCur, x, y, z, noiseScore);
     }
 
     // -----------------------------------------------------------------------
@@ -1823,17 +1957,9 @@ public:
     {
         if (cloudKeyPoses3D->points.empty())
         {
-            // Fresh start without loaded map
             noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e8, 1e8, 1e8).finished());
             gtSAMgraph.add(PriorFactor<Pose3>(0, trans2gtsamPose(transformTobeMapped), priorNoise));
             initialEstimate.insert(0, trans2gtsamPose(transformTobeMapped));
-        }
-        else if (mapLoaded && (int)cloudKeyPoses3D->size() == priorKeyframeCount)
-        {
-            // First new keyframe after map reuse: add as PriorFactor (not connected to loaded map via odom)
-            noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e-2, 1e-2, 1e-2).finished());
-            gtSAMgraph.add(PriorFactor<Pose3>(priorKeyframeCount, trans2gtsamPose(transformTobeMapped), priorNoise));
-            initialEstimate.insert(priorKeyframeCount, trans2gtsamPose(transformTobeMapped));
         }
         else
         {
@@ -1927,22 +2053,36 @@ public:
 
     void addLoopFactor()
     {
-        if (loopIndexQueue.empty())
-            return;
-
-        for (int i = 0; i < (int)loopIndexQueue.size(); ++i)
+        // Intra-session loop closure: BetweenFactor
+        if (!loopIndexQueue.empty())
         {
-            int indexFrom = loopIndexQueue[i].first;
-            int indexTo = loopIndexQueue[i].second;
-            gtsam::Pose3 poseBetween = loopPoseQueue[i];
-            gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i];
-            gtSAMgraph.add(BetweenFactor<Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
+            for (int i = 0; i < (int)loopIndexQueue.size(); ++i)
+            {
+                int indexFrom = loopIndexQueue[i].first;
+                int indexTo   = loopIndexQueue[i].second;
+                gtSAMgraph.add(BetweenFactor<Pose3>(indexFrom, indexTo, loopPoseQueue[i], loopNoiseQueue[i]));
+            }
+            loopIndexQueue.clear();
+            loopPoseQueue.clear();
+            loopNoiseQueue.clear();
+            aLoopIsClosed = true;
         }
 
-        loopIndexQueue.clear();
-        loopPoseQueue.clear();
-        loopNoiseQueue.clear();
-        aLoopIsClosed = true;
+        // Map-based loop closure: PriorFactor (GPS-like, fixed reference)
+        if (!loopPriorIndexQueue.empty())
+        {
+            for (int i = 0; i < (int)loopPriorIndexQueue.size(); ++i)
+            {
+                gtSAMgraph.add(PriorFactor<Pose3>(loopPriorIndexQueue[i],
+                                                  loopPriorPoseQueue[i],
+                                                  loopPriorNoiseQueue[i]));
+                ROS_INFO("[MapLoop] PriorFactor added for new-session key %d", loopPriorIndexQueue[i]);
+            }
+            loopPriorIndexQueue.clear();
+            loopPriorPoseQueue.clear();
+            loopPriorNoiseQueue.clear();
+            aLoopIsClosed = true;
+        }
     }
 
     float range(pcl::PointXYZRGB pt)
